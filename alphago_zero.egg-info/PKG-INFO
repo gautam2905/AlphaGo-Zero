@@ -1,0 +1,32 @@
+Metadata-Version: 2.2
+Name: alphago-zero
+Version: 1.0.0
+Summary: AlphaGo Zero implementation in PyTorch
+Author: AlphaGo Zero Implementation
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.8
+Requires-Dist: torch>=1.12.0
+Requires-Dist: torchvision>=0.13.0
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: gym>=0.21.0
+Requires-Dist: python-snappy>=0.6.0
+Requires-Dist: six>=1.16.0
+Requires-Dist: matplotlib>=3.5.0
+Requires-Dist: tqdm>=4.64.0
+Requires-Dist: pytest>=7.0.0
+Requires-Dist: black>=22.0.0
+Requires-Dist: flake8>=4.0.0
+Requires-Dist: numba>=0.56.0
+Requires-Dist: psutil>=5.9.0
+Dynamic: author
+Dynamic: classifier
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
