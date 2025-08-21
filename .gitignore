@@ -1,2 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific
+/checkpoints/
+/logs/
+/temp/
+/sgf_data/
+/expert_games/
+/models/
+/data/
+/runs/
+/outputs/
+/results/
+/utilities_and_tests/
+
+# Documentation (keep only essential docs)
+/PROFESSOR_PRESENTATION/
 /CLAUDE.md
 /DETAILED_DOCUMENTATION.md
+
+# Debug and test files
+debug_*.py
+test_*.py
+*_test.py
+demo_*.py
+check_*.py
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.env
+.env.local
+
+# System
+Thumbs.db
+.directory
+
+# Tensorboard
+events.out.tfevents.*
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Weights & Biases
+wandb/
+
+# MLflow
+mlruns/
+mlflow.db
+
+# Academic/Personal
+/acade
+academic_*
+personal_*

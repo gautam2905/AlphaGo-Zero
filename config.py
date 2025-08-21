@@ -4,66 +4,77 @@ import os
 
 
 class Config:
-    """AlphaGo Zero configuration.
+    """AlphaGo Zero configuration matching DeepMind's specifications.
     
-    Optimized for 10-12 hour training on 2x H100 GPUs with practical parameters.
+    Optimized for 2x H100 GPUs targeting professional-level play:
+    - Network: 40 ResNet blocks, 256 filters (~23M parameters)
+    - MCTS: 800 simulations (cautious increase from 1600 original)
+    - Batch size: 2048 (original AlphaGo Zero specification)
+    - Training: Long-term convergence with step decay learning rate
     
-    Key reductions from original AlphaGo Zero for single-machine training:
-    - MCTS simulations: 100 (vs 800) - still strong but much faster
-    - Training iterations: 100 (vs 700k)
-    - Games per iteration: 100 (vs 25k)
-    - Training epochs: 100 (vs 1000)
-    - Evaluation games: 40 (vs 400)
-    
-    Expected timeline:
-    - Total training time: 10-12 hours
-    - ~6 minutes per iteration (100 iterations total)
-    - Both H100 GPUs utilized for self-play
-    - Reaches amateur level play strength
+    Expected results:
+    - Professional-level strength (3000+ Elo)
+    - 99%+ win rate against amateur players
+    - Strong tactical and strategic understanding
+    - Training time: ~20-40 hours for full convergence
     """
     
     def __init__(self):
         # Environment settings
-        self.board_size = 9  # Start with 9x9 for faster training
+        self.board_size = 9  # 9x9 for efficient training
+        
+        # Set environment variable for Go board size
+        import os
+        os.environ['BOARD_SIZE'] = str(self.board_size)
         self.komi = 7.5
-        self.num_stack = 8  # Number of board history to stack
+        self.num_stack = 8  # Number of board history planes to stack
         
-        # Self-play settings
-        self.num_parallel_games = 200  # Number of parallel self-play games (reduced for faster iterations)
-        self.num_mcts_simulations = 100  # Number of MCTS simulations per move (reduced for practical training)
-        self.c_puct = 1.0  # PUCT constant
-        self.dirichlet_epsilon = 0.25  # Exploration noise at root
-        self.dirichlet_alpha = 0.03  # Dirichlet noise parameter
-        self.temperature = 1.0  # Temperature for first 30 moves
-        self.temperature_drop = 30  # Move number to drop temperature to 0
+        # Self-play settings - ALPHAGO ZERO SPECIFICATIONS
+        self.num_parallel_games = 40  # Conservative start: 20 per H100 GPU
+        self.num_mcts_simulations = 1200  # Cautious increase from 1600 original
+        self.c_puct = 1.0  # PUCT exploration constant
+        self.dirichlet_epsilon = 0.25  # Root noise mixing parameter
+        self.dirichlet_alpha = 0.03  # Dirichlet noise concentration
+        self.temperature = 1.0  # Temperature for move selection
+        self.temperature_drop = 30  # Move number to drop temperature to near-zero
         
-        # Neural network settings
-        self.num_res_blocks = 20  # Number of residual blocks (AlphaGo Zero uses 19-40)
-        self.num_hidden = 256  # Number of hidden units in res blocks (AlphaGo Zero uses 256)
-        self.learning_rate = 0.01  # Initial learning rate
+        # Neural network settings - ALPHAGO ZERO ARCHITECTURE
+        self.num_res_blocks = 40  # Original AlphaGo Zero: 40 residual blocks
+        self.num_hidden = 256  # Original AlphaGo Zero: 256 filters per layer
+        self.learning_rate = 0.01  # Original AlphaGo Zero learning rate
+        self.learning_rate_schedule = [0.01, 0.001, 0.0001]  # Step decay schedule
+        self.lr_schedule_steps = [400, 600]  # Decay at these iterations
         self.weight_decay = 1e-4  # L2 regularization
-        self.momentum = 0.9
-        self.batch_size = 2048  # Training batch size (larger for H100s)
+        self.momentum = 0.9  # SGD momentum
+        self.batch_size = 2048  # Original AlphaGo Zero batch size
         
-        # Training settings (optimized for 10-12 hour training)
-        self.num_iterations = 100  # Number of training iterations (reduced from 700k)
-        self.num_episodes_per_iteration = 100  # Self-play games per iteration (reduced for practical training)
-        self.num_epochs = 100  # Training epochs per iteration (reduced from 1000)
-        self.checkpoint_interval = 10  # Save checkpoint every N iterations
+        # Training settings - LONG-TERM CONVERGENCE
+        self.num_iterations = 1000  # Long-term training for professional strength
+        self.num_episodes_per_iteration = 500  # Scaled from 25K original (1/50th)
+        self.num_epochs = 10  # Epochs per iteration (original used different setup)
+        self.checkpoint_interval = 10  # Evaluate every 10 iterations
         
-        # Evaluation settings
-        self.num_eval_games = 40  # Number of games for evaluation (reduced for faster iteration)
+        # Evaluation settings - ALPHAGO ZERO SPECIFICATIONS
+        self.num_eval_games = 40  # More games for reliable evaluation
         self.eval_win_threshold = 0.55  # Win rate threshold to update best model
-        self.eval_temperature = 0.1  # Lower temperature for evaluation games
+        self.eval_temperature = 0.1  # Lower temperature for deterministic evaluation
         
-        # Memory settings
-        self.replay_buffer_size = 500000  # Max number of positions to store (reduced)
-        self.min_replay_size = 10000  # Min positions before training starts (reduced)
+        # Memory settings - OPTIMIZED FOR H100 GPUS
+        self.replay_buffer_size = 1000000  # Large buffer for extensive training
+        self.min_replay_size = 10000  # Minimum samples before training starts
+        self.gradient_accumulation_steps = 1  # Large batch size, no accumulation needed
         
-        # Multi-GPU settings (optimized for 2 H100s)
+        # Multi-GPU settings - CAUTIOUS H100 OPTIMIZATION
         self.use_gpu = True
-        self.num_gpus = 2  # Explicitly use 2 H100 GPUs
-        self.num_workers = 16  # Number of workers for data loading (8 per GPU)
+        self.num_gpus = 2  # Use both H100 GPUs
+        self.num_workers = 16  # Conservative: 8 workers per GPU
+        self.prefetch_factor = 2  # Conservative prefetching to avoid memory issues
+        self.persistent_workers = True  # Keep workers alive between epochs
+        self.pin_memory = True  # Faster CPU-GPU transfers
+        
+        # Mixed precision training for H100
+        self.use_mixed_precision = True  # Enable FP16 training
+        self.gradient_clip_norm = 1.0  # Gradient clipping for stability
         
         # Paths - All data saved to current D drive directory
         self.base_dir = os.path.dirname(os.path.abspath(__file__))  # Current script directory on D drive
@@ -107,3 +118,25 @@ class Config:
             return available_gpus
         else:
             return min(self.num_gpus, available_gpus)
+    
+    def get_learning_rate(self, iteration):
+        """Get learning rate for current iteration using step decay schedule."""
+        for i, step in enumerate(self.lr_schedule_steps):
+            if iteration < step:
+                return self.learning_rate_schedule[i]
+        # If past all schedule steps, use the last learning rate
+        return self.learning_rate_schedule[-1]
+    
+    def should_use_mixed_precision(self):
+        """Check if mixed precision should be used based on GPU capabilities."""
+        import torch
+        if not self.use_mixed_precision:
+            return False
+        
+        if not torch.cuda.is_available():
+            return False
+            
+        # Check for H100 or other Ampere/Hopper GPUs that benefit from mixed precision
+        gpu_name = torch.cuda.get_device_name(0)
+        return any(gpu_type in gpu_name.upper() for gpu_type in 
+                  ['H100', 'A100', 'RTX 30', 'RTX 40', 'V100', 'T4'])

@@ -2,6 +2,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 import math
 import torch
+from torch.amp import autocast
 import copy as cp
 
 
@@ -74,9 +75,14 @@ class MCTS:
         
         root = Node(self.game, self.args, state, visit_count=1, to_play=self.game.to_play)
         
-        # Get neural network prediction
+        # Get neural network prediction for root with mixed precision (BFloat16 for H100)
         state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        policy, _ = self.model(state_tensor)
+        use_bfloat16 = self.device.type == 'cuda' and torch.cuda.is_bf16_supported()
+        dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+        with autocast('cuda', enabled=self.device.type == 'cuda', dtype=dtype):
+            policy, _ = self.model(state_tensor)
+            # Convert to float32 for softmax to avoid BFloat16 issues
+            policy = policy.float()
         policy = torch.softmax(policy, axis=1).squeeze(0).cpu().numpy()
         policy = (1 - self.args['dirichlet_epsilon']) * policy + self.args['dirichlet_epsilon'] \
             * np.random.dirichlet([self.args['dirichlet_alpha']] * self.game.action_dim)
@@ -93,63 +99,82 @@ class MCTS:
         
         root.expand(policy, self.game)
         
-        for search in range(self.args['num_searches']):
-            node = root
+        # Batch neural network evaluations for H100 efficiency
+        # Larger batch sizes for better H100 GPU utilization with 800+ simulations
+        batch_size = min(64, max(16, self.args['num_searches'] // 10))  # Adaptive batch size
+        
+        for batch_start in range(0, self.args['num_searches'], batch_size):
+            batch_end = min(batch_start + batch_size, self.args['num_searches'])
+            batch_nodes = []
+            batch_paths = []
             
-            # Create a lightweight copy of the game for this simulation
-            # Instead of deep copying the entire game, we'll track moves and apply them
-            simulation_moves = []
-            
-            # Traverse the tree
-            path = [node]
-            while node.is_fully_expanded():
-                node = node.select()
-                path.append(node)
-                # Track moves for this simulation
-                if node.action_taken is not None:
-                    simulation_moves.append(node.action_taken)
-            
-            # For now, assume game is not terminal at leaf node
-            # In a full implementation, we'd apply simulation_moves to check
-            is_terminal = False
-            value = 0
-            
-            if not is_terminal:
-                # Use current game state for leaf evaluation (simplified)
-                current_state = self.game.observation()
-                state_tensor = torch.tensor(current_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            # Collect leaf nodes for batch evaluation
+            for search in range(batch_start, batch_end):
+                node = root
+                simulation_moves = []
                 
-                policy, value = self.model(state_tensor)
-                policy = torch.softmax(policy, axis=1).squeeze(0).cpu().numpy()
+                # Traverse the tree to find leaf node
+                path = [node]
+                while node.is_fully_expanded():
+                    node = node.select()
+                    path.append(node)
+                    if node.action_taken is not None:
+                        simulation_moves.append(node.action_taken)
                 
-                # Mask invalid moves
-                valid_moves = self.game.legal_actions
-                policy *= valid_moves
-                policy_sum = np.sum(policy)
-                if policy_sum > 0:
-                    policy /= policy_sum
-                else:
-                    policy = valid_moves / np.sum(valid_moves)
-                
-                value = value.item()
-                
-                # Update node state for expansion
-                node.state = current_state
-                node.expand(policy, self.game)
+                batch_nodes.append(node)
+                batch_paths.append(path)
             
-            # Backpropagate value through the path
-            # The value is from the perspective of the player at the leaf node
-            # We need to be careful about which player's perspective the value is from
-            for i, node in enumerate(reversed(path)):
-                # For the leaf node, use the value directly
-                # For other nodes, flip the value based on turn alternation
-                if i == 0:
-                    node.value_sum += value
-                    node.visit_count += 1
-                else:
-                    value = -value
-                    node.value_sum += value
-                    node.visit_count += 1    
+            # Batch evaluate all leaf nodes
+            if batch_nodes:
+                states = []
+                for node in batch_nodes:
+                    # Use current game state (simplified - in practice would apply simulation moves)
+                    current_state = self.game.observation()
+                    states.append(current_state)
+                
+                # Stack states into batch tensor
+                if states:
+                    states_tensor = torch.tensor(np.stack(states), dtype=torch.float32, device=self.device)
+                    use_bfloat16 = self.device.type == 'cuda' and torch.cuda.is_bf16_supported()
+                    dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+                    with autocast('cuda', enabled=self.device.type == 'cuda', dtype=dtype):
+                        policies_batch, values_batch = self.model(states_tensor)
+                        # Convert to float32 for softmax to avoid BFloat16 issues
+                        policies_batch = policies_batch.float()
+                        values_batch = values_batch.float()
+                    policies_batch = torch.softmax(policies_batch, axis=1).cpu().numpy()
+                    values_batch = values_batch.cpu().numpy()
+                    
+                    # Process batch results
+                    for i, (node, path) in enumerate(zip(batch_nodes, batch_paths)):
+                        policy = policies_batch[i]
+                        value = values_batch[i].item()
+                        
+                        # Mask invalid moves
+                        valid_moves = self.game.legal_actions
+                        policy *= valid_moves
+                        policy_sum = np.sum(policy)
+                        if policy_sum > 0:
+                            policy /= policy_sum
+                        else:
+                            policy = valid_moves / np.sum(valid_moves)
+                        
+                        # Expand node if not terminal
+                        if not node.is_fully_expanded():
+                            node.expand(policy, self.game)
+                        
+                        # Backpropagate value through the path
+                        current_value = value
+                        for j, path_node in enumerate(reversed(path)):
+                            # For the leaf node, use the value directly
+                            # For other nodes, flip the value based on turn alternation
+                            if j == 0:
+                                path_node.value_sum += current_value
+                                path_node.visit_count += 1
+                            else:
+                                current_value = -current_value
+                                path_node.value_sum += current_value
+                                path_node.visit_count += 1    
             
             
         action_probs = np.zeros(self.game.action_dim)

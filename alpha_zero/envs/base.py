@@ -11,8 +11,8 @@ import sys
 from copy import copy
 from six import StringIO
 import numpy as np
-import gym
-from gym.spaces import Box, Discrete
+import gymnasium as gym
+from gymnasium.spaces import Box, Discrete
 
 from alpha_zero.envs.coords import CoordsConvertor
 

@@ -27,29 +27,104 @@ def create_directory(path: str):
         os.makedirs(path)
 
 
-def save_checkpoint(model, optimizer, iteration, filepath):
-    """Save model checkpoint."""
+def save_checkpoint(model, optimizer, iteration, filepath, scaler=None, extra_state=None):
+    """Save model checkpoint with full training state.
+    
+    Args:
+        model: The model to save
+        optimizer: The optimizer to save
+        iteration: Current training iteration
+        filepath: Path to save checkpoint
+        scaler: GradScaler for mixed precision (optional)
+        extra_state: Additional state dict to save (optional)
+    """
+    # Handle DataParallel models - save the underlying model
+    model_state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+    
     checkpoint = {
         'iteration': iteration,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': model_state_dict,
         'optimizer_state_dict': optimizer.state_dict(),
     }
+    
+    # Save mixed precision scaler state if available
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+    
+    # Save any extra training state
+    if extra_state is not None:
+        checkpoint.update(extra_state)
+    
+    # Create backup of existing checkpoint
+    if os.path.exists(filepath):
+        backup_path = filepath.replace('.pth', '_backup.pth')
+        os.rename(filepath, backup_path)
+    
     torch.save(checkpoint, filepath)
-    print(f"Checkpoint saved at iteration {iteration}")
+    print(f"✓ Checkpoint saved at iteration {iteration} to {filepath}")
 
 
-def load_checkpoint(model, optimizer, filepath):
-    """Load model checkpoint."""
-    if os.path.isfile(filepath):
-        checkpoint = torch.load(filepath)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        iteration = checkpoint['iteration']
-        print(f"Checkpoint loaded from iteration {iteration}")
-        return iteration
-    else:
+def load_checkpoint(model, optimizer, filepath, scaler=None, device=None):
+    """Load model checkpoint with full training state.
+    
+    Args:
+        model: The model to load into
+        optimizer: The optimizer to load into
+        filepath: Path to load checkpoint from
+        scaler: GradScaler for mixed precision (optional)
+        device: Device to map tensors to (optional)
+        
+    Returns:
+        iteration: The iteration number from checkpoint, or 0 if failed
+    """
+    if not os.path.isfile(filepath):
         print(f"No checkpoint found at {filepath}")
         return 0
+    
+    try:
+        # Load checkpoint with proper device mapping
+        map_location = device if device else 'cpu'
+        checkpoint = torch.load(filepath, map_location=map_location)
+        
+        # Handle different checkpoint formats
+        model_state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        # Handle DataParallel models - the checkpoint has no 'module.' prefix
+        # but the current model might be wrapped in DataParallel
+        if hasattr(model, 'module'):
+            # Current model is DataParallel, but checkpoint might not have 'module.' prefix
+            try:
+                model.module.load_state_dict(model_state_dict)
+            except RuntimeError:
+                # Try loading directly if keys don't match
+                model.load_state_dict(model_state_dict)
+        else:
+            # Current model is not DataParallel
+            # Remove 'module.' prefix from checkpoint if it exists
+            if any(key.startswith('module.') for key in model_state_dict.keys()):
+                cleaned_state_dict = {}
+                for key, value in model_state_dict.items():
+                    new_key = key[7:] if key.startswith('module.') else key
+                    cleaned_state_dict[new_key] = value
+                model.load_state_dict(cleaned_state_dict)
+            else:
+                model.load_state_dict(model_state_dict)
+        
+        # Load optimizer state
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load mixed precision scaler state if available
+        if scaler is not None and 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        iteration = checkpoint.get('iteration', 0)
+        print(f"✓ Checkpoint loaded from iteration {iteration}")
+        return iteration
+        
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        raise e
 
 
 def save_config(config, filepath):

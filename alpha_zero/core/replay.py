@@ -8,7 +8,19 @@
 
 from typing import Mapping, Text, Any, NamedTuple, Optional, Sequence
 import numpy as np
-import snappy
+
+# Try to import snappy compression (optional)
+try:
+    import python_snappy as snappy
+    HAS_SNAPPY = True
+    
+except ImportError:
+    try:
+        import snappy
+        HAS_SNAPPY = True
+    except (ImportError, AttributeError):
+        HAS_SNAPPY = False
+        snappy = None
 
 
 class Transition(NamedTuple):
@@ -21,15 +33,32 @@ TransitionStructure = Transition(state=None, pi_prob=None, value=None)
 
 
 def compress_array(array):
-    """Compresses a numpy array with snappy."""
-    return snappy.compress(array), array.shape, array.dtype
+    """Compresses a numpy array with snappy if available, otherwise returns uncompressed."""
+    if HAS_SNAPPY and snappy is not None:
+        try:
+            return snappy.compress(array.tobytes()), array.shape, array.dtype
+        except:
+            # Fallback to no compression
+            return array, array.shape, array.dtype
+    else:
+        # No compression available
+        return array, array.shape, array.dtype
 
 
 def uncompress_array(compressed):
-    """Uncompresses a numpy array with snappy given its shape and dtype."""
-    compressed_array, shape, dtype = compressed
-    byte_string = snappy.uncompress(compressed_array)
-    return np.frombuffer(byte_string, dtype=dtype).reshape(shape)
+    """Uncompresses a numpy array with snappy if it was compressed."""
+    if len(compressed) == 3 and isinstance(compressed[0], bytes):
+        # Data is compressed
+        compressed_array, shape, dtype = compressed
+        if HAS_SNAPPY and snappy is not None:
+            byte_string = snappy.uncompress(compressed_array)
+            return np.frombuffer(byte_string, dtype=dtype).reshape(shape)
+    elif len(compressed) == 3 and isinstance(compressed[0], np.ndarray):
+        # Data is not compressed
+        return compressed[0]
+    else:
+        # Direct numpy array
+        return compressed[0] if isinstance(compressed, tuple) else compressed
 
 
 class UniformReplay:
