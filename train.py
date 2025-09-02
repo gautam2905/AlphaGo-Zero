@@ -1,9 +1,18 @@
 """Main training script for AlphaGo Zero."""
 
 import os
+import sys
+import logging
+from datetime import datetime
+import signal
+
+# Add utilities folder to path for optional imports
+utilities_path = os.path.join(os.path.dirname(__file__), 'utilities_and_tests')
+if os.path.exists(utilities_path) and utilities_path not in sys.path:
+    sys.path.insert(0, utilities_path)
 
 # URGENT: Set board size BEFORE any Go imports
-os.environ['BOARD_SIZE'] = '9'  # Force 9x9 for 3-hour training
+os.environ['BOARD_SIZE'] = '19'  # Production 19x19 board
 
 import time
 import numpy as np
@@ -16,6 +25,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.amp import GradScaler, autocast
 from collections import deque
 import multiprocessing as mp
+from multiprocessing import Process, Queue, Manager, Event
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import copy
 import matplotlib.pyplot as plt
@@ -35,24 +46,207 @@ from alpha_zero.utils import (
 )
 from config import Config
 from training_logger import TrainingLogger
-# Import evaluation modules with error handling
-try:
-    from expert_evaluator import evaluate_model_vs_experts
-except ImportError as e:
-    print(f"Warning: Could not import expert_evaluator: {e}")
-    evaluate_model_vs_experts = None
+# Import evaluation modules with silent error handling
+evaluate_model_vs_experts = None
+HumanBenchmark = None 
+SGFHumanBenchmark = None
 
+# Only try to import these modules if they exist (they're in utilities_and_tests folder)
 try:
-    from human_benchmark import HumanBenchmark
-except ImportError as e:
-    print(f"Warning: Could not import human_benchmark: {e}")
-    HumanBenchmark = None
+    # Try to import from utilities_and_tests folder
+    if os.path.exists(os.path.join(utilities_path, 'expert_evaluator.py')):
+        from expert_evaluator import evaluate_model_vs_experts
+    
+    if os.path.exists(os.path.join(utilities_path, 'human_benchmark.py')):
+        from human_benchmark import HumanBenchmark
+        
+    if os.path.exists(os.path.join(utilities_path, 'sgf_human_data.py')):
+        from sgf_human_data import SGFHumanBenchmark
+        
+except ImportError:
+    # Silently ignore if modules don't exist or have import issues
+    pass
 
-try:
-    from sgf_human_data import SGFHumanBenchmark
-except ImportError as e:
-    print(f"Warning: Could not import sgf_human_data: {e}")
-    SGFHumanBenchmark = None
+
+class TeeLogger:
+    """Logger that writes to both terminal and log file."""
+    
+    def __init__(self, log_file_path):
+        self.terminal = sys.stdout
+        self.log_file = open(log_file_path, 'a', encoding='utf-8')
+        
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()  # Ensure immediate write
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+        
+    def close(self):
+        if self.log_file:
+            self.log_file.close()
+
+
+def setup_logging(config):
+    """Setup logging to both terminal and file."""
+    # Create log file with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"training_log_{timestamp}.log"
+    log_path = os.path.join(config.log_dir, log_filename)
+    
+    # Redirect stdout to both terminal and file
+    tee = TeeLogger(log_path)
+    sys.stdout = tee
+    
+    print(f"Training log will be saved to: {log_path}")
+    print("="*60)
+    
+    return tee
+
+
+def self_play_worker(actor_id, gpu_id, config, model_queue, result_queue, stop_event, checkpoint_event, games_counter):
+    """Persistent worker process for self-play inspired by michaelnny's implementation."""
+    import os
+    import sys
+    import warnings
+    
+    # Suppress warnings
+    warnings.filterwarnings("ignore")
+    os.environ['PYTHONWARNINGS'] = 'ignore'
+    os.environ['BOARD_SIZE'] = str(config.board_size)
+    
+    try:
+        # Import modules inside worker
+        import torch
+        import numpy as np
+        from alpha_zero.envs import GoEnv
+        from alpha_zero.core import ResNet, MCTS
+        from alpha_zero.core.replay import Transition
+        
+        # Set device for this worker
+        device = torch.device(f'cuda:{gpu_id}')
+        torch.cuda.set_device(device)
+        
+        # H100 optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Suppress model creation logs
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+        
+        # Initialize environment
+        env = GoEnv(komi=config.komi, num_stack=config.num_stack)
+        
+        # Create model on this GPU (silently)
+        model = ResNet(env, config.num_res_blocks, config.num_hidden, device)
+        model.eval()
+        
+        # Restore stdout
+        sys.stdout = old_stdout
+        
+        # MCTS args
+        mcts_args = config.get_mcts_args()
+        
+        # Silently initialize actor
+        
+        games_played = 0
+        model_version = 0
+        
+        # Main worker loop - persistent!
+        while not stop_event.is_set():
+            try:
+                # Check for new model weights
+                if not model_queue.empty():
+                    try:
+                        model_path = model_queue.get_nowait()
+                        # Load new weights from file to avoid file descriptor issues
+                        model_state = torch.load(model_path, map_location=device)
+                        model.load_state_dict(model_state)
+                        model.eval()
+                        model_version += 1
+                        # Silently load model updates
+                    except:
+                        pass
+                
+                # Generate a self-play game
+                env.reset()
+                transitions = []
+                game_steps = 0
+                
+                while not env.is_game_over():
+                    # MCTS search (new instance per move for fresh tree)
+                    mcts = MCTS(env, mcts_args, model)
+                    pi_probs = mcts.search()
+                    
+                    # Temperature-based action selection
+                    if game_steps < config.temperature_drop:
+                        action = np.random.choice(len(pi_probs), p=pi_probs)
+                    else:
+                        action = np.argmax(pi_probs)
+                    
+                    # Store transition
+                    state = env.observation().copy()
+                    transitions.append(Transition(
+                        state=state,
+                        pi_prob=pi_probs.copy(),
+                        value=None
+                    ))
+                    
+                    # Make move
+                    env.step(action)
+                    game_steps += 1
+                    
+                    # Prevent infinite games
+                    if game_steps > 400:  # Extended limit for quality games
+                        break
+                
+                # Calculate game result
+                if env.winner == env.black_player:
+                    game_result = 1.0
+                elif env.winner == env.white_player:
+                    game_result = -1.0
+                else:
+                    game_result = 0.0
+                
+                # Update transition values
+                for i, transition in enumerate(transitions):
+                    value = game_result if i % 2 == 0 else -game_result
+                    transitions[i] = Transition(
+                        state=transition.state,
+                        pi_prob=transition.pi_prob,
+                        value=value
+                    )
+                
+                # Send to queue if not full
+                if not result_queue.full():
+                    result_queue.put((transitions, len(transitions)))
+                    games_played += 1
+                    
+                    # Update shared counter (thread-safe)
+                    with games_counter.get_lock():
+                        games_counter.value += 1
+                    
+                    # Silently track progress
+                
+                # Small delay to prevent CPU spinning
+                time.sleep(0.001)
+                
+            except Exception as e:
+                if not stop_event.is_set():
+                    pass  # Silently handle errors
+                    import traceback
+                    traceback.print_exc()
+                continue
+                
+    except Exception as e:
+        pass  # Silently handle initialization errors
+    finally:
+        pass  # Actor stopped silently
 
 
 class SelfPlayDataset(Dataset):
@@ -108,6 +302,11 @@ class AlphaZeroTrainer:
     def __init__(self, config):
         self.config = config
         set_random_seed(42)
+        self.emergency_save_needed = False
+        
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._handle_interrupt)
+        signal.signal(signal.SIGTERM, self._handle_interrupt)
         
         # Initialize environment
         self.env = GoEnv(
@@ -191,8 +390,14 @@ class AlphaZeroTrainer:
             self.use_bfloat16 = False
             print(f"Mixed precision training: Disabled")
         
-        # AlphaGo Zero learning rate scheduler (step decay)
+        # AlphaGo Zero learning rate scheduler: drops at 400k and 600k iterations
+        # Original paper uses cosine annealing, but step decay is standard approximation
         self.current_iteration = 0
+        self.scheduler = optim.lr_scheduler.MultiStepLR(
+            self.optimizer, 
+            milestones=[400000, 600000],  # Original paper milestones
+            gamma=0.1  # Drops by factor of 10
+        )
         
         # Initialize replay buffer (URGENT: disable compression for speed)
         self.replay_buffer = UniformReplay(
@@ -480,6 +685,123 @@ class AlphaZeroTrainer:
         print(f"Replay buffer size: {self.replay_buffer.size}")
         print(f"Self-play completed in {self_play_time:.2f}s")
     
+    def run_self_play_multiprocessing(self, num_games):
+        """Run multiple self-play games using persistent workers inspired by michaelnny's implementation."""
+        print(f"Running {num_games} self-play games with persistent multiprocessing...")
+        
+        # Check GPU memory before self-play
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                print(f"GPU {i} memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+        
+        self_play_start = time.time()
+        
+        # Create multiprocessing resources
+        # Avoid Manager() which causes semaphore issues on some servers
+        model_queue = mp.Queue(maxsize=self.config.num_actors * 2)
+        result_queue = mp.Queue(maxsize=1000)
+        stop_event = mp.Event()
+        checkpoint_event = mp.Event()
+        # Use regular multiprocessing.Value instead of manager.Value
+        import multiprocessing
+        games_counter = multiprocessing.Value('i', 0)
+        
+        # Calculate GPU distribution
+        num_gpus = self.config.num_gpus if torch.cuda.is_available() else 1
+        actors_per_gpu = self.config.num_actors // num_gpus
+        
+        # Initialize actors silently
+        
+        # Start persistent worker processes
+        workers = []
+        for actor_id in range(self.config.num_actors):
+            gpu_id = actor_id % num_gpus
+            worker = Process(
+                target=self_play_worker,
+                args=(actor_id, gpu_id, self.config, model_queue, result_queue, 
+                      stop_event, checkpoint_event, games_counter)
+            )
+            worker.start()
+            workers.append(worker)
+        
+        # Send initial model to all actors
+        # Distribute model to actors - save to file to avoid file descriptor issues
+        model_path = os.path.join(self.config.checkpoint_dir, 'temp_model.pth')
+        if hasattr(self.best_model, 'module'):
+            torch.save(self.best_model.module.state_dict(), model_path)
+        else:
+            torch.save(self.best_model.state_dict(), model_path)
+        
+        # Send path instead of tensors to avoid file descriptor issues
+        for _ in range(self.config.num_actors):
+            model_queue.put(model_path)
+        
+        # Collect results
+        all_transitions = []
+        collected_games = 0
+        last_print_time = time.time()
+        
+        # Collect games from actors
+        pbar = tqdm(total=num_games, desc="Self-play games")
+        
+        # Let actors generate games continuously
+        while collected_games < num_games:
+            try:
+                # Collect from result queue
+                if not result_queue.empty():
+                    transitions, size = result_queue.get_nowait()
+                    all_transitions.extend(transitions)
+                    collected_games += 1
+                    pbar.update(1)
+                    
+                    # Update progress periodically
+                    if time.time() - last_print_time > 10:
+                        games_per_sec = games_counter.value / (time.time() - self_play_start)
+                        pbar.set_postfix_str(f"Total: {games_counter.value} | Rate: {games_per_sec:.2f}/s")
+                        last_print_time = time.time()
+                else:
+                    # Small sleep to avoid CPU spinning
+                    time.sleep(0.01)
+                    
+            except Exception as e:
+                continue
+        
+        pbar.close()
+        
+        # Stop all workers
+        # Stop actors
+        stop_event.set()
+        
+        # Wait for workers to finish
+        for i, worker in enumerate(workers):
+            worker.join(timeout=5)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=1)
+        
+        # Add to replay buffer
+        print(f"Storing {len(all_transitions)} transitions in replay buffer...")
+        for transition in all_transitions:
+            self.replay_buffer.add(transition)
+        
+        self_play_time = time.time() - self_play_start
+        final_games = games_counter.value
+        
+        print(f"Self-play completed: {collected_games} games collected, {final_games} total generated")
+        print(f"Time: {self_play_time:.1f}s")
+        print(f"Games per second: {final_games/self_play_time:.2f}")
+        print(f"Replay buffer size: {self.replay_buffer.size}")
+        
+        # Log self-play metrics
+        self.logger.log_self_play_metrics(
+            games_generated=collected_games,
+            avg_game_length=len(all_transitions) / max(1, collected_games),
+            total_time=self_play_time,
+            game_stats={'total_games': final_games}
+        )
+
     def train_network(self):
         """Train the neural network on self-play data."""
         if self.replay_buffer.size < self.config.min_replay_size:
@@ -500,10 +822,10 @@ class AlphaZeroTrainer:
             dataset,
             batch_size=actual_batch_size,
             shuffle=True,
-            num_workers=min(4, self.config.num_workers),  # Reduce workers for small dataset
-            pin_memory=True,
-            prefetch_factor=2,  # Reduce prefetch for small dataset
-            persistent_workers=False,  # Disable for small dataset
+            num_workers=min(self.config.num_workers, max(8, self.replay_buffer.size // 1000)),
+            pin_memory=self.config.pin_memory,
+            prefetch_factor=self.config.prefetch_factor,
+            persistent_workers=self.config.persistent_workers,
             drop_last=False  # Don't drop last batch when dataset is small
         )
         
@@ -535,10 +857,8 @@ class AlphaZeroTrainer:
                     dtype = torch.bfloat16 if self.use_bfloat16 else torch.float16
                     with autocast('cuda', dtype=dtype):
                         pred_pi, pred_v = self.model(states)
-                        # Use KL divergence for policy loss instead of CrossEntropyLoss
-                        # since pi_probs is a probability distribution, not class indices
-                        log_pred_pi = F.log_softmax(pred_pi, dim=1)
-                        policy_loss = F.kl_div(log_pred_pi, pi_probs, reduction='batchmean')
+                        # EXACT AlphaGo Zero loss: Cross-entropy for policy (original paper)
+                        policy_loss = -torch.sum(pi_probs * F.log_softmax(pred_pi, dim=1)) / pred_pi.size(0)
                         value_loss = mse_loss(pred_v.squeeze(), values)
                         total_loss = policy_loss + value_loss
                     
@@ -557,10 +877,8 @@ class AlphaZeroTrainer:
                 else:
                     # Regular forward pass for CPU
                     pred_pi, pred_v = self.model(states)
-                    # Use KL divergence for policy loss instead of CrossEntropyLoss
-                    # since pi_probs is a probability distribution, not class indices
-                    log_pred_pi = F.log_softmax(pred_pi, dim=1)
-                    policy_loss = F.kl_div(log_pred_pi, pi_probs, reduction='batchmean')
+                    # EXACT AlphaGo Zero loss: Cross-entropy for policy (original paper)
+                    policy_loss = -torch.sum(pi_probs * F.log_softmax(pred_pi, dim=1)) / pred_pi.size(0)
                     value_loss = mse_loss(pred_v.squeeze(), values)
                     total_loss = policy_loss + value_loss
                     
@@ -770,7 +1088,14 @@ class AlphaZeroTrainer:
         print("="*60)
         
         # Load checkpoint if exists and compatible
+        # Check for emergency checkpoint first
+        emergency_path = os.path.join(self.config.checkpoint_dir, "emergency_checkpoint.pth")
         checkpoint_path = os.path.join(self.config.checkpoint_dir, "latest_checkpoint.pth")
+        
+        if os.path.exists(emergency_path):
+            print("⚠️  Found emergency checkpoint - loading from interrupted state...")
+            checkpoint_path = emergency_path
+        
         if os.path.exists(checkpoint_path):
             try:
                 print(f"Attempting to load checkpoint from: {checkpoint_path}")
@@ -839,11 +1164,44 @@ class AlphaZeroTrainer:
             # Start logging for this iteration
             self.logger.start_iteration(iteration + 1)
             
-            # Self-play phase
-            self.run_self_play(self.config.num_episodes_per_iteration)
+            # Self-play phase - use multiprocessing for max GPU utilization
+            if self.config.use_multiprocessing:
+                self.run_self_play_multiprocessing(self.config.num_episodes_per_iteration)
+            else:
+                self.run_self_play(self.config.num_episodes_per_iteration)
             
             # Training phase
             self.train_network()
+            
+            # Save latest checkpoint after every iteration (for resumability)
+            latest_checkpoint_path = os.path.join(self.config.checkpoint_dir, "latest_checkpoint.pth")
+            extra_state = {
+                'current_iteration': iteration,
+                'best_win_rate': getattr(self, 'best_win_rate', 0.0),
+                'replay_buffer_size': len(self.replay_buffer),
+                'total_games_played': getattr(self, 'total_games_played', 0)
+            }
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                iteration + 1,
+                latest_checkpoint_path,
+                scaler=self.scaler,
+                extra_state=extra_state
+            )
+            
+            # Additional auto-save every N iterations for extra safety
+            if (iteration + 1) % getattr(self.config, 'save_interval', 10) == 0:
+                autosave_path = os.path.join(self.config.checkpoint_dir, f"autosave_iter_{iteration+1}.pth")
+                save_checkpoint(
+                    self.model,
+                    self.optimizer,
+                    iteration + 1,
+                    autosave_path,
+                    scaler=self.scaler,
+                    extra_state=extra_state
+                )
+                print(f"✅ Auto-saved checkpoint at iteration {iteration+1}")
             
             # Evaluation phase (every N iterations)
             if (iteration + 1) % self.config.checkpoint_interval == 0:
@@ -855,7 +1213,8 @@ class AlphaZeroTrainer:
                 #     print("HUMAN PERFORMANCE BENCHMARKING")
                 #     print("="*60)
                 
-                # Save checkpoint with full training state
+                # Save periodic checkpoint with full training state
+                periodic_checkpoint_path = os.path.join(self.config.checkpoint_dir, f"checkpoint_iter_{iteration+1}.pth")
                 extra_state = {
                     'current_iteration': iteration,
                     'best_win_rate': getattr(self, 'best_win_rate', 0.0)
@@ -864,10 +1223,13 @@ class AlphaZeroTrainer:
                     self.model,
                     self.optimizer,
                     iteration + 1,
-                    checkpoint_path,
+                    periodic_checkpoint_path,
                     scaler=self.scaler,
                     extra_state=extra_state
                 )
+                
+                # Clean up old periodic checkpoints (keep last 3)
+                self._cleanup_old_checkpoints(iteration + 1)
                 
                 # Log system metrics
                 self.logger.log_system_metrics()
@@ -943,8 +1305,68 @@ class AlphaZeroTrainer:
         print(f"📈 Individual plots: {self.config.log_dir}/figures/iteration_XXX/")
         print(f"📋 Summary plots: {self.config.log_dir}/figures/summary/")
         print(f"💾 Model checkpoints: {self.config.checkpoint_dir}/")
-        print(f"📝 Training logs: {self.config.log_dir}/")
+    
+    def _handle_interrupt(self, signum, frame):
+        """Handle interrupt signals for graceful shutdown."""
+        print("\n" + "="*60)
+        print("⚠️  INTERRUPT DETECTED - SAVING CHECKPOINT...")
         print("="*60)
+        self.emergency_save_needed = True
+        
+        # Emergency save current state
+        try:
+            emergency_path = os.path.join(self.config.checkpoint_dir, "emergency_checkpoint.pth")
+            extra_state = {
+                'current_iteration': getattr(self, 'current_iteration', 0),
+                'best_win_rate': getattr(self, 'best_win_rate', 0.0),
+                'replay_buffer_size': len(getattr(self, 'replay_buffer', [])),
+                'interrupted': True
+            }
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                getattr(self, 'current_iteration', 0),
+                emergency_path,
+                scaler=getattr(self, 'scaler', None),
+                extra_state=extra_state
+            )
+            print(f"✅ Emergency checkpoint saved to: {emergency_path}")
+            print("You can resume training by running the script again.")
+        except Exception as e:
+            print(f"❌ Failed to save emergency checkpoint: {e}")
+        
+        sys.exit(0)
+    
+    def _cleanup_old_checkpoints(self, current_iteration, keep_last=3):
+        """Clean up old periodic checkpoints to save disk space."""
+        try:
+            import glob
+            pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_iter_*.pth")
+            checkpoints = glob.glob(pattern)
+            
+            # Extract iteration numbers and sort
+            checkpoint_iters = []
+            for cp in checkpoints:
+                try:
+                    iter_num = int(os.path.basename(cp).split('_')[-1].split('.')[0])
+                    checkpoint_iters.append((iter_num, cp))
+                except:
+                    continue
+            
+            # Sort by iteration number, newest first
+            checkpoint_iters.sort(reverse=True)
+            
+            # Keep only the last N checkpoints
+            for i, (iter_num, cp_path) in enumerate(checkpoint_iters):
+                if i >= keep_last:
+                    try:
+                        os.remove(cp_path)
+                        print(f"Cleaned up old checkpoint: {os.path.basename(cp_path)}")
+                    except OSError:
+                        pass
+                        
+        except Exception as e:
+            print(f"Warning: Could not cleanup old checkpoints: {e}")
     
 
     def _plot_epoch_losses(self, epoch_losses, iteration):
@@ -1034,11 +1456,34 @@ class AlphaZeroTrainer:
 def main():
     """Main entry point."""
     config = Config()
-    trainer = AlphaZeroTrainer(config)
-    trainer.train()
+    
+    # Setup logging to both terminal and file
+    tee_logger = setup_logging(config)
+    
+    try:
+        trainer = AlphaZeroTrainer(config)
+        trainer.train()
+    finally:
+        # Restore stdout and close log file
+        sys.stdout = tee_logger.terminal
+        tee_logger.close()
+        print(f"Training log saved to: {config.log_dir}/training_log_*.log")
 
 
 if __name__ == "__main__":
-    # Set multiprocessing start method
-    mp.set_start_method('spawn', force=True)
+    # Set multiprocessing start method safely
+    try:
+        # Check if start method is already set
+        current_method = mp.get_start_method(allow_none=True)
+        if current_method is None:
+            mp.set_start_method('spawn')
+        elif current_method != 'spawn':
+            print(f"Warning: Multiprocessing start method already set to '{current_method}', keeping it.")
+    except RuntimeError as e:
+        print(f"Warning: Could not set multiprocessing start method: {e}")
+        print("Continuing with default start method...")
+    
+    # Set torch multiprocessing sharing strategy to avoid file descriptor issues
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
     main()

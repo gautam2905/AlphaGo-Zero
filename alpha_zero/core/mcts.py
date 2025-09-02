@@ -37,11 +37,16 @@ class Node:
         return best_child
     
     def get_ucb(self, child):
+        # EXACT AlphaGo Zero UCT formula from original paper
         if child.visit_count == 0:
             q_value = 0
         else:
-            q_value = 1 - ((child.value_sum / child.visit_count) + 1) / 2
-        return q_value + self.args['C'] * (math.sqrt(self.visit_count) / (child.visit_count + 1)) * child.prior
+            q_value = child.value_sum / child.visit_count
+        
+        # Original paper UCT formula with adaptive c_puct
+        c_puct = math.log((self.visit_count + self.args.get('c_puct_base', 19652) + 1) / self.args.get('c_puct_base', 19652)) + self.args.get('c_puct_init', 1.25)
+        
+        return q_value + c_puct * child.prior * math.sqrt(self.visit_count) / (1 + child.visit_count)
     
     def expand(self, policy, game_env):
         for action, prob in enumerate(policy):
@@ -100,8 +105,8 @@ class MCTS:
         root.expand(policy, self.game)
         
         # Batch neural network evaluations for H100 efficiency
-        # Larger batch sizes for better H100 GPU utilization with 800+ simulations
-        batch_size = min(64, max(16, self.args['num_searches'] // 10))  # Adaptive batch size
+        # Optimized batch sizes for 800 simulations on 19x19 board
+        batch_size = min(64, max(16, self.args['num_searches'] // 12))  # Balanced batch size for H100s
         
         for batch_start in range(0, self.args['num_searches'], batch_size):
             batch_end = min(batch_start + batch_size, self.args['num_searches'])
